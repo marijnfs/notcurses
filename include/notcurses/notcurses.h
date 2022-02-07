@@ -631,7 +631,7 @@ API int notcurses_ucs32_to_utf8(const uint32_t* ucs32, unsigned ucs32count,
 //
 //    U+FDFD ARABIC LIGATURE BISMILLAH AR-RAHMAN AR-RAHEEM ﷽
 //
-// wcwidth() rather optimistically claims this most exalted glyph to occupy
+// wcwidth() rather optimistically claims nccelthis most exalted glyph to occupy
 // a single column. BiDi text is too complicated for me to even get into here.
 // Be assured there are no easy answers; ours is indeed a disturbing Universe.
 //
@@ -727,14 +727,23 @@ typedef struct nccell {
 // protect against such misuse here. problems *will* ensue. similarly, do not
 // set channel flags other than colors/alpha. we assign non-printing glyphs
 // a width of 1 to match utf8_egc_len()'s behavior for whitespace/NUL.
-#define NCCELL_INITIALIZER(c, s, chan) { .gcluster = (htole(c)), .gcluster_backstop = 0,\
-  .width = (uint8_t)((wcwidth(c) < 0 || !c) ? 1 : wcwidth(c)), .stylemask = (s), .channels = (chan), }
-// python fails on #define CELL_CHAR_INITIALIZER(c) CELL_INITIALIZER(c, 0, 0)
-#define NCCELL_CHAR_INITIALIZER(c) { .gcluster = (htole(c)), .gcluster_backstop = 0,\
-  .width = (uint8_t)((wcwidth(c) < 0 || !c) ? 1 : wcwidth(c)), .stylemask = 0, .channels = 0, }
-// python fails on #define CELL_TRIVIAL_INITIALIZER CELL_CHAR_INITIALIZER(0)
-#define NCCELL_TRIVIAL_INITIALIZER { .gcluster = 0, .gcluster_backstop = 0,\
-                                     .width = 1, .stylemask = 0, .channels = 0, }
+
+
+
+static inline nccell NCCELL_INITIALIZER(uint32_t c, uint16_t s, uint64_t chan) {
+  nccell cell = { .gcluster = (htole(c)), .gcluster_backstop = 0,
+  .width = (uint8_t)((wcwidth(c) < 0 || !c) ? 1 : wcwidth(c)), .stylemask = (s), .channels = (chan), };
+  return cell;  
+}
+
+static inline nccell NCCELL_CHAR_INITIALIZER(uint32_t c) {
+  return NCCELL_INITIALIZER(c, 0, 0);
+}
+
+static inline nccell NCCELL_TRIVIAL_INITIALIZER() {
+  return NCCELL_INITIALIZER(0, 0, 0);
+}
+
 
 static inline void
 nccell_init(nccell* c){
@@ -3140,9 +3149,9 @@ static inline int
 ncplane_rounded_box(struct ncplane* n, uint16_t styles, uint64_t channels,
                     unsigned ystop, unsigned xstop, unsigned ctlword){
   int ret = 0;
-  nccell ul = NCCELL_TRIVIAL_INITIALIZER, ur = NCCELL_TRIVIAL_INITIALIZER;
-  nccell ll = NCCELL_TRIVIAL_INITIALIZER, lr = NCCELL_TRIVIAL_INITIALIZER;
-  nccell hl = NCCELL_TRIVIAL_INITIALIZER, vl = NCCELL_TRIVIAL_INITIALIZER;
+  nccell ul = NCCELL_TRIVIAL_INITIALIZER(), ur = NCCELL_TRIVIAL_INITIALIZER();
+  nccell ll = NCCELL_TRIVIAL_INITIALIZER(), lr = NCCELL_TRIVIAL_INITIALIZER();
+  nccell hl = NCCELL_TRIVIAL_INITIALIZER(), vl = NCCELL_TRIVIAL_INITIALIZER();
   if((ret = nccells_rounded_box(n, styles, channels, &ul, &ur, &ll, &lr, &hl, &vl)) == 0){
     ret = ncplane_box(n, &ul, &ur, &ll, &lr, &hl, &vl, ystop, xstop, ctlword);
   }
@@ -3160,12 +3169,12 @@ ncplane_perimeter_rounded(struct ncplane* n, uint16_t stylemask,
   }
   unsigned dimy, dimx;
   ncplane_dim_yx(n, &dimy, &dimx);
-  nccell ul = NCCELL_TRIVIAL_INITIALIZER;
-  nccell ur = NCCELL_TRIVIAL_INITIALIZER;
-  nccell ll = NCCELL_TRIVIAL_INITIALIZER;
-  nccell lr = NCCELL_TRIVIAL_INITIALIZER;
-  nccell vl = NCCELL_TRIVIAL_INITIALIZER;
-  nccell hl = NCCELL_TRIVIAL_INITIALIZER;
+  nccell ul = NCCELL_TRIVIAL_INITIALIZER();
+  nccell ur = NCCELL_TRIVIAL_INITIALIZER();
+  nccell ll = NCCELL_TRIVIAL_INITIALIZER();
+  nccell lr = NCCELL_TRIVIAL_INITIALIZER();
+  nccell vl = NCCELL_TRIVIAL_INITIALIZER();
+  nccell hl = NCCELL_TRIVIAL_INITIALIZER();
   if(nccells_rounded_box(n, stylemask, channels, &ul, &ur, &ll, &lr, &hl, &vl)){
     return -1;
   }
@@ -3189,9 +3198,9 @@ static inline int
 ncplane_double_box(struct ncplane* n, uint16_t styles, uint64_t channels,
                    unsigned ylen, unsigned xlen, unsigned ctlword){
   int ret = 0;
-  nccell ul = NCCELL_TRIVIAL_INITIALIZER, ur = NCCELL_TRIVIAL_INITIALIZER;
-  nccell ll = NCCELL_TRIVIAL_INITIALIZER, lr = NCCELL_TRIVIAL_INITIALIZER;
-  nccell hl = NCCELL_TRIVIAL_INITIALIZER, vl = NCCELL_TRIVIAL_INITIALIZER;
+  nccell ul = NCCELL_TRIVIAL_INITIALIZER(), ur = NCCELL_TRIVIAL_INITIALIZER();
+  nccell ll = NCCELL_TRIVIAL_INITIALIZER(), lr = NCCELL_TRIVIAL_INITIALIZER();
+  nccell hl = NCCELL_TRIVIAL_INITIALIZER(), vl = NCCELL_TRIVIAL_INITIALIZER();
   if((ret = nccells_double_box(n, styles, channels, &ul, &ur, &ll, &lr, &hl, &vl)) == 0){
     ret = ncplane_box(n, &ul, &ur, &ll, &lr, &hl, &vl, ylen, xlen, ctlword);
   }
@@ -3205,9 +3214,9 @@ static inline int
 ncplane_ascii_box(struct ncplane* n, uint16_t styles, uint64_t channels,
                   unsigned ylen, unsigned xlen, unsigned ctlword){
   int ret = 0;
-  nccell ul = NCCELL_TRIVIAL_INITIALIZER, ur = NCCELL_TRIVIAL_INITIALIZER;
-  nccell ll = NCCELL_TRIVIAL_INITIALIZER, lr = NCCELL_TRIVIAL_INITIALIZER;
-  nccell hl = NCCELL_TRIVIAL_INITIALIZER, vl = NCCELL_TRIVIAL_INITIALIZER;
+  nccell ul = NCCELL_TRIVIAL_INITIALIZER(), ur = NCCELL_TRIVIAL_INITIALIZER();
+  nccell ll = NCCELL_TRIVIAL_INITIALIZER(), lr = NCCELL_TRIVIAL_INITIALIZER();
+  nccell hl = NCCELL_TRIVIAL_INITIALIZER(), vl = NCCELL_TRIVIAL_INITIALIZER();
   if((ret = nccells_ascii_box(n, styles, channels, &ul, &ur, &ll, &lr, &hl, &vl)) == 0){
     ret = ncplane_box(n, &ul, &ur, &ll, &lr, &hl, &vl, ylen, xlen, ctlword);
   }
@@ -3225,12 +3234,12 @@ ncplane_perimeter_double(struct ncplane* n, uint16_t stylemask,
   }
   unsigned dimy, dimx;
   ncplane_dim_yx(n, &dimy, &dimx);
-  nccell ul = NCCELL_TRIVIAL_INITIALIZER;
-  nccell ur = NCCELL_TRIVIAL_INITIALIZER;
-  nccell ll = NCCELL_TRIVIAL_INITIALIZER;
-  nccell lr = NCCELL_TRIVIAL_INITIALIZER;
-  nccell vl = NCCELL_TRIVIAL_INITIALIZER;
-  nccell hl = NCCELL_TRIVIAL_INITIALIZER;
+  nccell ul = NCCELL_TRIVIAL_INITIALIZER();
+  nccell ur = NCCELL_TRIVIAL_INITIALIZER();
+  nccell ll = NCCELL_TRIVIAL_INITIALIZER();
+  nccell lr = NCCELL_TRIVIAL_INITIALIZER();
+  nccell vl = NCCELL_TRIVIAL_INITIALIZER();
+  nccell hl = NCCELL_TRIVIAL_INITIALIZER();
   if(nccells_double_box(n, stylemask, channels, &ul, &ur, &ll, &lr, &hl, &vl)){
     return -1;
   }

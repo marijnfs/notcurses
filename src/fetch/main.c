@@ -599,9 +599,9 @@ infoplane_notcurses(struct notcurses* nc, const fetched_info* fi,
   ncplane_printf_aligned(infop, 5, NCALIGN_CENTER, "%s (%d cores)",
                          fi->cpu_model ? fi->cpu_model : fallback_cpuinfo(),
                          fi->core_count);
-  nccell ul = NCCELL_TRIVIAL_INITIALIZER, ur = NCCELL_TRIVIAL_INITIALIZER;
-  nccell ll = NCCELL_TRIVIAL_INITIALIZER, lr = NCCELL_TRIVIAL_INITIALIZER;
-  nccell hl = NCCELL_TRIVIAL_INITIALIZER, vl = NCCELL_TRIVIAL_INITIALIZER;
+  nccell ul = NCCELL_TRIVIAL_INITIALIZER(), ur = NCCELL_TRIVIAL_INITIALIZER();
+  nccell ll = NCCELL_TRIVIAL_INITIALIZER(), lr = NCCELL_TRIVIAL_INITIALIZER();
+  nccell hl = NCCELL_TRIVIAL_INITIALIZER(), vl = NCCELL_TRIVIAL_INITIALIZER();
   if(nccells_rounded_box(infop, 0, 0, &ul, &ur, &ll, &lr, &hl, &vl)){
     return -1;
   }

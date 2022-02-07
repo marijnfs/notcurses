@@ -39,7 +39,7 @@ legend(struct notcurses* nc, const char* msg){
   if(n == NULL){
     return NULL;
   }
-  nccell c = NCCELL_TRIVIAL_INITIALIZER;
+  nccell c = NCCELL_TRIVIAL_INITIALIZER();
   nccell_set_fg_rgb8(&c, 0, 0, 0); // darken surrounding characters by half
   nccell_set_fg_alpha(&c, NCALPHA_BLEND);
   nccell_set_bg_alpha(&c, NCALPHA_TRANSPARENT); // don't touch background
