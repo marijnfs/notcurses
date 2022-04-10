@@ -1,6 +1,6 @@
 % notcurses_selector(3)
 % nick black <nickblack@linux.com>
-% v3.0.5
+% v3.0.8
 
 # NAME
 
@@ -88,6 +88,8 @@ on the scroll arrows will be handled.
 
 **ncselector_destroy** destroys the backing **ncplane**, as does
 **ncselector_create** in the event of any error.
+
+As no flags exist, the **flags** option ought always be 0.
 
 # RETURN VALUES
 

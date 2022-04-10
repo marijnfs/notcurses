@@ -1,24 +1,54 @@
 #include <math.h>
+#include <stdatomic.h>
 #include "internal.h"
 #include "fbuf.h"
 
 #define RGBSIZE 3
 
-// returns the number of individual sixels necessary to represent the specified
-// pixel geometry. these might encompass more pixel rows than |dimy| would
-// suggest, up to the next multiple of 6 (i.e. a single row becomes a 6-row
-// bitmap; as do two, three, four, five, or six rows). input is scaled geometry.
-static inline int
-sixelcount(int dimy, int dimx){
-  return (dimy + 5) / 6 * dimx;
-}
+// number of worker threads
+// FIXME fit to local machine, but more than 3 never seems to help
+#define POPULATION 3
 
-// returns the number of sixel bands (horizontal series of sixels, aka 6 rows)
-// for |dimy| source rows. sixels are encoded as a series of sixel bands.
-static inline int
-sixelbandcount(int dimy){
-  return sixelcount(dimy, 1);
-}
+// a worker can have up to three qstates enqueued for work
+#define WORKERDEPTH 3
+
+// this palette entry is a sentinel for a transparent pixel (and thus caps
+// the palette at 65535 other entries).
+#define TRANS_PALETTE_ENTRY 65535
+
+// bytes per element in the auxiliary vector
+#define AUXVECELEMSIZE 2
+
+// three scaled sixel [0..100x3] components plus a population count.
+typedef struct qsample {
+  unsigned char comps[RGBSIZE];
+  uint32_t pop;
+} qsample;
+
+// lowest samples for each node. first-order nodes track 1000 points in
+// sixelspace (10x10x10). there are eight possible second-order nodes from a
+// fractured first-order node, covering 125 points each (5x5x5).
+typedef struct qnode {
+  qsample q;
+  // cidx plays two roles. during merge, we select the active set, and extract
+  // them (since they'll be sorted, we can't operate directly on the octree).
+  // here, we use cidx to map back to the initial octree entry, as we need
+  // update them (from the active set) at the end of merging. afterwards, the
+  // high bit indicates that it was chosen, and the cidx is a valid index into
+  // the final color table. it is otherwise a link to the merged qnode.
+  // during initial filtering, qlink determines whether a node has fractured:
+  // if qlink is non-zero, it is a one-biased index to an onode.
+  // FIXME combine these once more, but for now to keep it easy, we have two.
+  // qlink links back into the octree.
+  uint16_t qlink;
+  uint16_t cidx;
+} qnode;
+
+// an octree-style node, used for fractured first-order nodes. the first
+// bit is whether we're on the top or bottom of the R, then G, then B.
+typedef struct onode {
+  qnode* q[8];
+} onode;
 
 // we set P2 based on whether there is any transparency in the sixel. if not,
 // use SIXEL_P2_ALLOPAQUE (0), for faster drawing in certain terminals.
@@ -55,12 +85,103 @@ typedef struct sixelmap {
   sixel_p2_e p2;         // set to SIXEL_P2_TRANS if we have transparent pixels
 } sixelmap;
 
-// second pass: construct data for extracted colors over the sixels. the
-// map will be persisted in the sprixel; the remainder is lost.
-// FIXME kill this off; induct directly into qstate
-typedef struct sixeltable {
-  sixelmap* map;        // copy of palette indices / transparency bits
-} sixeltable;
+typedef struct qstate {
+  int refcount; // initialized to worker count
+  atomic_int bandbuilder; // threads take bands as their work unit
+  // we always work in terms of quantized colors (quantization is the first
+  // step of rendering), using indexes into the derived palette. the actual
+  // palette need only be stored during the initial render, since the sixel
+  // header can be preserved, and the palette is unchanged by wipes/restores.
+  unsigned char* table;  // |colors| x RGBSIZE components
+  qnode* qnodes;
+  onode* onodes;
+  unsigned dynnodes_free;
+  unsigned dynnodes_total;
+  unsigned onodes_free;
+  unsigned onodes_total;
+  const struct blitterargs* bargs;
+  const uint32_t* data;
+  int linesize;
+  sixelmap* smap;
+  // these are the leny and lenx passed to sixel_blit(), which are likely
+  // different from those reachable through bargs->len{y,x}!
+  int leny, lenx;
+} qstate;
+
+// a work_queue per worker thread. if used == WORKERDEPTH, this thread is
+// backed up, and we cannot enqueue to it. writeto wraps around the array.
+typedef struct work_queue {
+  qstate* qstates[WORKERDEPTH];
+  unsigned writeto;
+  unsigned used;
+  struct sixel_engine* sengine;
+} work_queue;
+
+// we keep a few worker threads (POPULATION) spun up to assist with
+// quantization. each has an array of up to WORKERDEPTH qstates to work on.
+typedef struct sixel_engine {
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  work_queue queues[POPULATION];
+  pthread_t tids[POPULATION];
+  bool done;
+} sixel_engine;
+
+// enqueue |qs| to any workers with available space. the number of workers with
+// a reference will be stored in |qs|->refcount.
+static void
+enqueue_to_workers(sixel_engine* eng, qstate* qs){
+  if(eng == NULL){
+    return;
+  }
+  int usecount = 0;
+  pthread_mutex_lock(&eng->lock);
+  for(int i = 0 ; i < POPULATION ; ++i){
+    work_queue* wq = &eng->queues[i];
+    if(wq->used < WORKERDEPTH){
+      wq->qstates[wq->writeto] = qs;
+      ++wq->used;
+      ++usecount;
+      if(++wq->writeto == WORKERDEPTH){
+        wq->writeto = 0;
+      }
+    }
+  }
+  qs->refcount = usecount;
+  pthread_mutex_unlock(&eng->lock);
+  if(usecount){
+    pthread_cond_broadcast(&eng->cond);
+  }
+}
+
+// block until all workers have finished up with |qs|
+static void
+block_on_workers(sixel_engine* eng, qstate* qs){
+  if(eng == NULL){
+    return;
+  }
+  pthread_mutex_lock(&eng->lock);
+  while(qs->refcount){
+    pthread_cond_wait(&eng->cond, &eng->lock);
+  }
+  pthread_mutex_unlock(&eng->lock);
+}
+
+// returns the number of individual sixels necessary to represent the specified
+// pixel geometry. these might encompass more pixel rows than |dimy| would
+// suggest, up to the next multiple of 6 (i.e. a single row becomes a 6-row
+// bitmap; as do two, three, four, five, or six rows). input is scaled geometry.
+static inline int
+sixelcount(int dimy, int dimx){
+  return (dimy + 5) / 6 * dimx;
+}
+
+// returns the number of sixel bands (horizontal series of sixels, aka 6 rows)
+// for |dimy| source rows. sixels are encoded as a series of sixel bands.
+static inline int
+sixelbandcount(int dimy){
+  return sixelcount(dimy, 1);
+}
 
 // whip up a sixelmap sans data for the specified pixel geometry and color
 // register count.
@@ -102,37 +223,6 @@ void sixelmap_free(sixelmap *s){
   }
 }
 
-// three scaled sixel [0..100x3] components plus a population count.
-typedef struct qsample {
-  unsigned char comps[RGBSIZE];
-  uint32_t pop;
-} qsample;
-
-// lowest samples for each node. first-order nodes track 1000 points in
-// sixelspace (10x10x10). there are eight possible second-order nodes from a
-// fractured first-order node, covering 125 points each (5x5x5).
-typedef struct qnode {
-  qsample q;
-  // cidx plays two roles. during merge, we select the active set, and extract
-  // them (since they'll be sorted, we can't operate directly on the octree).
-  // here, we use cidx to map back to the initial octree entry, as we need
-  // update them (from the active set) at the end of merging. afterwards, the
-  // high bit indicates that it was chosen, and the cidx is a valid index into
-  // the final color table. it is otherwise a link to the merged qnode.
-  // during initial filtering, qlink determines whether a node has fractured:
-  // if qlink is non-zero, it is a one-biased index to an onode.
-  // FIXME combine these once more, but for now to keep it easy, we have two.
-  // qlink links back into the octree.
-  uint16_t qlink;
-  uint16_t cidx;
-} qnode;
-
-// an octree-style node, used for fractured first-order nodes. the first
-// bit is whether we're on the top or bottom of the R, then G, then B.
-typedef struct onode {
-  qnode* q[8];
-} onode;
-
 // convert rgb [0..255] to sixel [0..99]
 static inline unsigned
 ss(unsigned c){
@@ -173,27 +263,6 @@ qidx(const qnode* q){
   return q->cidx & ~0x8000u;
 }
 
-typedef struct qstate {
-  // we always work in terms of quantized colors (quantization is the first
-  // step of rendering), using indexes into the derived palette. the actual
-  // palette need only be stored during the initial render, since the sixel
-  // header can be preserved, and the palette is unchanged by wipes/restores.
-  unsigned char* table;  // |colors| x RGBSIZE components
-  qnode* qnodes;
-  onode* onodes;
-  unsigned dynnodes_free;
-  unsigned dynnodes_total;
-  unsigned onodes_free;
-  unsigned onodes_total;
-  const struct blitterargs* bargs;
-  const uint32_t* data;
-  int linesize;
-  sixeltable* stab;
-  // these are the leny and lenx passed to sixel_blit(), which are likely
-  // different from those reachable through bargs->len{y,x}!
-  int leny, lenx;
-} qstate;
-
 #define QNODECOUNT 1000
 
 // create+zorch an array of QNODECOUNT qnodes. this is 1000 entries covering
@@ -204,26 +273,31 @@ typedef struct qstate {
 // we must have 8 dynnodes available for every onode we create, or we can run
 // into a situation where we don't have an available dynnode
 // (see insert_color()).
-static int
-alloc_qstate(unsigned colorregs, qstate* qs){
-  qs->dynnodes_free = colorregs;
-  qs->dynnodes_total = qs->dynnodes_free;
-  if((qs->qnodes = malloc((QNODECOUNT + qs->dynnodes_total) * sizeof(qnode))) == NULL){
-    return -1;
+static qstate*
+alloc_qstate(unsigned colorregs){
+  qstate* qs = malloc(sizeof(*qs));
+  if(qs){
+    qs->dynnodes_free = colorregs;
+    qs->dynnodes_total = qs->dynnodes_free;
+    if((qs->qnodes = malloc((QNODECOUNT + qs->dynnodes_total) * sizeof(qnode))) == NULL){
+      free(qs);
+      return NULL;
+    }
+    qs->onodes_free = qs->dynnodes_total / 8;
+    qs->onodes_total = qs->onodes_free;
+    if((qs->onodes = malloc(qs->onodes_total * sizeof(*qs->onodes))) == NULL){
+      free(qs->qnodes);
+      free(qs);
+      return NULL;
+    }
+    // don't technically need to clear the components, as we could
+    // check the pop, but it's hidden under the compulsory cache misses.
+    // we only initialize the static nodes, not the dynamic ones--we know
+    // when we pull a dynamic one that it needs its popcount initialized.
+    memset(qs->qnodes, 0, sizeof(qnode) * QNODECOUNT);
+    qs->table = NULL;
   }
-  qs->onodes_free = qs->dynnodes_total / 8;
-  qs->onodes_total = qs->onodes_free;
-  if((qs->onodes = malloc(qs->onodes_total * sizeof(*qs->onodes))) == NULL){
-    free(qs->qnodes);
-    return -1;
-  }
-  // don't technically need to clear the components, as we could
-  // check the pop, but it's hidden under the compulsory cache misses.
-  // we only initialize the static nodes, not the dynamic ones--we know
-  // when we pull a dynamic one that it needs its popcount initialized.
-  memset(qs->qnodes, 0, sizeof(qnode) * QNODECOUNT);
-  qs->table = NULL;
-  return 0;
+  return qs;
 }
 
 // free internals of qstate object
@@ -234,6 +308,7 @@ free_qstate(qstate *qs){
     free(qs->qnodes);
     free(qs->onodes);
     free(qs->table);
+    free(qs);
   }
 }
 
@@ -253,7 +328,7 @@ insert_color(qstate* qs, uint32_t pixel){
     q->q.comps[1] = g;
     q->q.comps[2] = b;
     q->q.pop = 1;
-    ++qs->stab->map->colors;
+    ++qs->smap->colors;
     return 0;
   }
   onode* o;
@@ -314,7 +389,7 @@ insert_color(qstate* qs, uint32_t pixel){
   o->q[skey]->q.comps[2] = b;
   o->q[skey]->qlink = 0;
   o->q[skey]->cidx = 0;
-  ++qs->stab->map->colors;
+  ++qs->smap->colors;
 //fprintf(stderr, "INSERTED[%u]: %u %u %u\n", key, q->q.comps[0], q->q.comps[1], q->q.comps[2]);
   return 0;
 }
@@ -338,21 +413,6 @@ find_color(const qstate* qs, uint32_t pixel){
     }
   }
   return qidx(q);
-}
-
-// create an auxiliary vector suitable for a Sixel sprixcell, and zero it out.
-// there are three bytes per pixel in the cell: a contiguous set of 16-bit
-// palette indices, and a contiguous set of two-value transparencies (these
-// could be folded down to bits from bytes, saving 7/8 of the space FIXME).
-static inline uint8_t*
-sixel_auxiliary_vector(const sprixel* s){
-  int pixels = ncplane_pile(s->n)->cellpxy * ncplane_pile(s->n)->cellpxx;
-  size_t slen = pixels * 3;
-  uint8_t* ret = malloc(slen);
-  if(ret){
-    memset(ret, 0, sizeof(slen));
-  }
-  return ret;
 }
 
 // the P2 parameter on a sixel specifies how unspecified pixels are drawn.
@@ -417,12 +477,56 @@ sixelband_extend(char* vec, struct band_extender* bes, int dimx, int curx){
   return vec;
 }
 
-// the sixel |rep| is being wiped. the active pixels need be written to the
-// |auxvec|, which is (|ey| - |sy| + 1) rows of (|ex| - |sx| + 1) columns.
-// we are wiping the sixel |rep|, changing it to |mask|.
+// write to this cell's auxvec, backing up the pixels cleared by a wipe. wipes
+// are requested at cell granularity, broken down into sixelbands, broken down
+// by color, and then finally effected at the sixel RLE level. we're thus in
+// any given call handling a horizontal contiguous range of sixels for a single
+// color. the x range is wholly within the cell to be wiped, but the y range
+// might not be, since cells and bands don't necessarily line up. |y| ought be
+// the row of the first pixel of the *band*.
+//
+// we thus need:
+//  - the starting and ending true x positions for the *portion of this sixel
+//     contained within the wiped cell*.
+//  - the true y position at which the sixel starts.
+//  - the previous sixel rep and the masked sixel rep--the difference between
+//     the two tells us which rows (offset from y) need be written. they ought
+//     be the binary forms, not the presentation forms (i.e. [0..63]).
+//  - the cell-pixel geometry, necessary for computing offset into the auxvec.
+//  - the color.
+//
+// precondition: mask is a bitwise proper subset of rep
+//
+// we find which [1..6] of six rows are affected by examining the difference
+// between |rep| and |masked|, the sixel's row within the cell by taking |y|
+// modulo |cellpxy|, and the position within the auxvec by multiplying that
+// result by |cellpxx| and adding |x| modulo |cellpxx|. we set |len| pixels.
 static inline void
-write_auxvec(uint8_t* auxvec, int color, int x, int len, int sx, int ex,
-             int sy, int ey, char rep, char mask){
+write_auxvec(uint8_t* auxvec, uint16_t color, int endy, int y, int x, int len,
+             char rep, char masked, int cellpxy, int cellpxx){
+  rep -= 63;
+  masked -= 63;
+  const char diff = rep ^ masked;
+//fprintf(stderr, "AUXVEC WRITE[%hu] ey: %d y/x: %d/%d:%d r: 0x%x m: 0x%x d: 0x%x total %d\n", color, endy, y, x, len, rep, masked, diff, cellpxy * cellpxx);
+  const int xoff = x % cellpxx;
+  const int yoff = y % cellpxy;
+  int dy = 0;
+  for(char bitselector = 1 ; bitselector < 0x40 ; bitselector <<= 1u, ++dy){
+    if((diff & bitselector) == 0){
+//if(diff == 0x20)fprintf(stderr, "diff: 0x%x bs: %d\n", diff, bitselector);
+      continue;
+    }
+    if(yoff + dy == endy){ // reached the next cell below
+//if(diff == 0x20)fprintf(stderr, "BOUNCING! 0x%x bs: %d %d > %d\n", diff, bitselector, yoff + dy, cellpxy);
+      break;
+    }
+//fprintf(stderr, " writing to auxrow %d (%d)\n", yoff + dy, bitselector);
+    const int idx = (((yoff + dy) % cellpxy) * cellpxx + xoff) * AUXVECELEMSIZE;
+//fprintf(stderr, " xoff: %d yoff: %d dy: %d ydy: %d idx: %d\n", xoff, yoff, dy, yoff + dy, idx);
+    for(int i = 0 ; i < len ; ++i){
+      memcpy(&auxvec[idx + i * AUXVECELEMSIZE], &color, AUXVECELEMSIZE);
+    }
+  }
 }
 
 // wipe the color within this band from startx to endx - 1, from starty to
@@ -430,14 +534,15 @@ write_auxvec(uint8_t* auxvec, int color, int x, int len, int sx, int ex,
 // auxvec. mask is the allowable sixel, y-wise. returns a positive number if
 // pixels were wiped.
 static inline int
-wipe_color(sixelband* b, int color, int startx, int endx,
-           int starty, int endy, char mask, int dimx, uint8_t* auxvec){
+wipe_color(sixelband* b, int color, int y, int endy, int startx, int endx,
+           char mask, int dimx, uint8_t* auxvec,
+           int cellpxy, int cellpxx){
   const char* vec = b->vecs[color];
   if(vec == NULL){
     return 0; // no work to be done here
   }
   int wiped = 0;
-  char* newvec = malloc(dimx);
+  char* newvec = malloc(dimx + 1);
   if(newvec == NULL){
     return -1;
   }
@@ -465,7 +570,7 @@ wipe_color(sixelband* b, int color, int startx, int endx,
       char rep = *vec;
       char masked = ((rep - 63) & mask) + 63;
 //fprintf(stderr, "X/RLE/ENDX: %d %d %d\n", x, rle, endx);
-      if(x + rle < startx){ // not wiped material; reproduce as-is
+      if(x + rle <= startx){ // not wiped material; reproduce as-is
         write_rle(newvec, &voff, rle, rep);
         x += rle;
       }else if(masked == rep){ // not changed by wipe; reproduce as-is
@@ -479,14 +584,15 @@ wipe_color(sixelband* b, int color, int startx, int endx,
           x = startx;
         }
         if(x + rle >= endx){
-          // FIXME this new rep might equal the next rep, in which case we ought combine
+          // FIXME this might equal the prev/next rep, and we ought combine
+//fprintf(stderr, "************************* %d %d %d\n", endx - x, x, rle);
           write_rle(newvec, &voff, endx - x, masked);
-          write_auxvec(auxvec, color, x, endx - x, startx, endx, starty, endy, rep, mask);
+          write_auxvec(auxvec, color, endy, y, x, endx - x, rep, masked, cellpxy, cellpxx);
           rle -= endx - x;
           x = endx;
         }else{
           write_rle(newvec, &voff, rle, masked);
-          write_auxvec(auxvec, color, x, rle, startx, endx, starty, endy, rep, mask);
+          write_auxvec(auxvec, color, endy, y, x, rle, rep, masked, cellpxy, cellpxx);
           x += rle;
           rle = 0;
         }
@@ -518,9 +624,8 @@ wipe_color(sixelband* b, int color, int startx, int endx,
 // number of pixels actually wiped.
 static inline int
 wipe_band(sixelmap* smap, int band, int startx, int endx,
-          int starty, int endy, int dimx, int cellpixy, int cellpixx,
+          int starty, int endy, int dimx, int cellpxy, int cellpxx,
           uint8_t* auxvec){
-//fprintf(stderr, "******************** BAND %d ********************8\n", band);
   int wiped = 0;
   // get 0-offset start and end row bounds for our band.
   const int sy = band * 6 < starty ? starty - band * 6 : 0;
@@ -530,14 +635,16 @@ wipe_band(sixelmap* smap, int band, int startx, int endx,
   unsigned char mask = 63;
   // knock out a bit for each row we're wiping within the band
   for(int i = 0 ; i < 6 ; ++i){
-    if(i >= sy && i <= ey){
+    if(i >= sy && i < ey){
       mask &= ~(1u << i);
     }
   }
+//fprintf(stderr, "******************** BAND %d MASK 0x%x ********************8\n", band, mask);
   sixelband* b = &smap->bands[band];
   // offset into map->data where our color starts
   for(int i = 0 ; i < b->size ; ++i){
-    wiped += wipe_color(b, i, startx, endx, starty, endy, mask, dimx, auxvec);
+    wiped += wipe_color(b, i, band * 6, endy, startx, endx, mask,
+                        dimx, auxvec, cellpxy, cellpxx);
   }
   return wiped;
 }
@@ -547,13 +654,12 @@ wipe_band(sixelmap* smap, int band, int startx, int endx,
 // redrawn, it's redrawn using P2=1.
 int sixel_wipe(sprixel* s, int ycell, int xcell){
 //fprintf(stderr, "WIPING %d/%d\n", ycell, xcell);
-  uint8_t* auxvec = sixel_auxiliary_vector(s);
+  uint8_t* auxvec = sixel_trans_auxvec(ncplane_pile(s->n));
   if(auxvec == NULL){
     return -1;
   }
   const int cellpxy = ncplane_pile(s->n)->cellpxy;
   const int cellpxx = ncplane_pile(s->n)->cellpxx;
-  memset(auxvec + cellpxx * cellpxy, 0xff, cellpxx * cellpxy);
   sixelmap* smap = s->smap;
   const int startx = xcell * cellpxx;
   const int starty = ycell * cellpxy;
@@ -760,10 +866,10 @@ choose(qstate* qs, qnode* q, int z, int i, int* hi, int* lo,
 // to the number of color registers.
 static inline int
 merge_color_table(qstate* qs){
-  if(qs->stab->map->colors == 0){
+  if(qs->smap->colors == 0){
     return 0;
   }
-  qnode* qactive = get_active_set(qs, qs->stab->map->colors);
+  qnode* qactive = get_active_set(qs, qs->smap->colors);
   if(qactive == NULL){
     return -1;
   }
@@ -772,8 +878,8 @@ merge_color_table(qstate* qs){
   // (this is not necessarily an optimizing huristic, but it'll do for now).
   int cidx = 0;
 //fprintf(stderr, "colors: %u cregs: %u\n", qs->colors, colorregs);
-  for(int z = qs->stab->map->colors - 1 ; z >= 0 ; --z){
-    if(qs->stab->map->colors >= qs->bargs->u.pixel.colorregs){
+  for(int z = qs->smap->colors - 1 ; z >= 0 ; --z){
+    if(qs->smap->colors >= qs->bargs->u.pixel.colorregs){
       if(cidx == qs->bargs->u.pixel.colorregs){
         break; // we just ran out of color registers
       }
@@ -782,7 +888,7 @@ merge_color_table(qstate* qs){
     ++cidx;
   }
   free(qactive);
-  if(qs->stab->map->colors > qs->bargs->u.pixel.colorregs){
+  if(qs->smap->colors > qs->bargs->u.pixel.colorregs){
     // tend to those which couldn't get a color table entry. we start with two
     // values, lo and hi, initialized to -1. we iterate over the *static* qnodes,
     // descending into onodes to check their qnodes. we thus iterate over all
@@ -813,7 +919,7 @@ merge_color_table(qstate* qs){
         choose(qs, &qs->qnodes[z], z, -1, &hi, &lo, &hq, &lq);
       }
     }
-    qs->stab->map->colors = qs->bargs->u.pixel.colorregs;
+    qs->smap->colors = qs->bargs->u.pixel.colorregs;
   }
   return 0;
 }
@@ -822,7 +928,7 @@ static inline void
 load_color_table(const qstate* qs){
   int loaded = 0;
   int total = QNODECOUNT + (qs->dynnodes_total - qs->dynnodes_free);
-  for(int z = 0 ; z < total && loaded < qs->stab->map->colors ; ++z){
+  for(int z = 0 ; z < total && loaded < qs->smap->colors ; ++z){
     const qnode* q = &qs->qnodes[z];
     if(chosen_p(q)){
       qs->table[RGBSIZE * qidx(q) + 0] = ss(q->q.comps[0]);
@@ -832,16 +938,17 @@ load_color_table(const qstate* qs){
     }
   }
 //fprintf(stderr, "loaded: %u colors: %u\n", loaded, qs->colors);
-  assert(loaded == qs->stab->map->colors);
+  assert(loaded == qs->smap->colors);
 }
 
 // build up a sixel band from (up to) 6 rows of the source RGBA.
 static inline int
 build_sixel_band(qstate* qs, int bnum){
-  sixelband* b = &qs->stab->map->bands[bnum];
-  b->size = qs->stab->map->colors;
+//fprintf(stderr, "building band %d\n", bnum);
+  sixelband* b = &qs->smap->bands[bnum];
+  b->size = qs->smap->colors;
   size_t bsize = sizeof(*b->vecs) * b->size;
-  size_t mlen = qs->stab->map->colors * sizeof(struct band_extender);
+  size_t mlen = qs->smap->colors * sizeof(struct band_extender);
   struct band_extender* meta = malloc(mlen);
   if(meta == NULL){
     return -1;
@@ -854,7 +961,7 @@ build_sixel_band(qstate* qs, int bnum){
   memset(b->vecs, 0, bsize);
   memset(meta, 0, mlen);
   const int ystart = qs->bargs->begy + bnum * 6;
-  const int endy = (bnum + 1 == qs->stab->map->sixelbands ?
+  const int endy = (bnum + 1 == qs->smap->sixelbands ?
                                  qs->leny - qs->bargs->begy : ystart + 6);
   struct {
     int color; // 0..colormax
@@ -913,7 +1020,7 @@ build_sixel_band(qstate* qs, int bnum){
       }
     }
   }
-  for(int i = 0 ; i < qs->stab->map->colors ; ++i){
+  for(int i = 0 ; i < qs->smap->colors ; ++i){
     if(meta[i].rle){ // color was wholly unused iff rle == 0 at end
       b->vecs[i] = sixelband_extend(b->vecs[i], &meta[i], qs->lenx, x);
       if(b->vecs[i] == NULL){
@@ -927,26 +1034,36 @@ build_sixel_band(qstate* qs, int bnum){
   return 0;
 }
 
-// we have converged upon some number of colors. we now run over the pixels
-// once again, and get the actual (color-indexed) sixels.
-static inline int
-build_data_table(qstate* qs){
-  sixeltable* stab = qs->stab;
-  if(stab->map->sixelbands == 0){
-    logerror("no sixels");
-    return -1;
-  }
-  for(int i = 0 ; i < qs->stab->map->sixelbands ; ++i){
-    if(build_sixel_band(qs, i) < 0){
+static int
+bandworker(qstate* qs){
+  int b;
+  while((b = qs->bandbuilder++) < qs->smap->sixelbands){
+    if(build_sixel_band(qs, b) < 0){
       return -1;
     }
   }
-  size_t tsize = RGBSIZE * qs->stab->map->colors;
+  return 0;
+}
+
+// we have converged upon some number of colors. we now run over the pixels
+// once again, and get the actual (color-indexed) sixels.
+static inline int
+build_data_table(sixel_engine* sengine, qstate* qs){
+  sixelmap* smap = qs->smap;
+  if(smap->sixelbands == 0){
+    logerror("no sixels");
+    return -1;
+  }
+  qs->bandbuilder = 0;
+  enqueue_to_workers(sengine, qs);
+  size_t tsize = RGBSIZE * smap->colors;
   qs->table = malloc(tsize);
   if(qs->table == NULL){
     return -1;
   }
   load_color_table(qs);
+  bandworker(qs);
+  block_on_workers(sengine, qs);
   return 0;
 }
 
@@ -979,7 +1096,7 @@ extract_cell_color_table(qstate* qs, long cellid){
   // transparent to mixed.
   if(cstarty >= cendy){ // we're entirely transparent sixel overhead
     tam[cellid].state = SPRIXCELL_TRANSPARENT;
-    qs->stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
+    qs->smap->p2 = SIXEL_P2_TRANS; // even one forces P2=1
     // FIXME need we set rmatrix?
     return 0;
   }
@@ -1041,18 +1158,18 @@ extract_cell_color_table(qstate* qs, long cellid){
   if(tam[cellid].state == SPRIXCELL_OPAQUE_SIXEL){
     rmatrix[cellid] = 0;
   }else{
-    qs->stab->map->p2 = SIXEL_P2_TRANS; // even one forces P2=1
+    qs->smap->p2 = SIXEL_P2_TRANS; // even one forces P2=1
   }
   return 0;
 }
 
 // we have a 4096-element array that takes the 4-5-3 MSBs from the RGB
-// comoponents. once it's complete, we might need to either merge some
+// components. once it's complete, we might need to either merge some
 // chunks, or expand them, converging towards the available number of
 // color registers. |ccols| is cell geometry; |leny| and |lenx| are pixel
 // geometry, and *do not* include sixel padding.
 static int
-extract_color_table(qstate* qs){
+extract_color_table(sixel_engine* sengine, qstate* qs){
   const blitterargs* bargs = qs->bargs;
   // use the cell geometry as computed by the visual layer; leny doesn't
   // include any mandatory sixel padding.
@@ -1073,14 +1190,14 @@ extract_color_table(qstate* qs){
       ++cellid;
     }
   }
-  loginfo("octree got %"PRIu32" entries", qs->stab->map->colors);
+  loginfo("octree got %"PRIu32" entries", qs->smap->colors);
   if(merge_color_table(qs)){
     return -1;
   }
-  if(build_data_table(qs)){
+  if(build_data_table(sengine, qs)){
     return -1;
   }
-  loginfo("final palette: %u/%u colors", qs->stab->map->colors, qs->bargs->u.pixel.colorregs);
+  loginfo("final palette: %u/%u colors", qs->smap->colors, qs->bargs->u.pixel.colorregs);
   return 0;
 }
 
@@ -1162,11 +1279,11 @@ write_sixel_header(qstate* qs, fbuf* f, int leny){
     return -1;
   }
   // Set Raster Attributes - pan/pad=1 (pixel aspect ratio), Ph=qs->lenx, Pv=leny
-  int r = write_sixel_intro(f, qs->stab->map->p2, leny, qs->lenx);
+  int r = write_sixel_intro(f, qs->smap->p2, leny, qs->lenx);
   if(r < 0){
     return -1;
   }
-  for(int i = 0 ; i < qs->stab->map->colors ; ++i){
+  for(int i = 0 ; i < qs->smap->colors ; ++i){
     const unsigned char* rgb = qs->table + i * RGBSIZE;
     //fprintf(fp, "#%d;2;%u;%u;%u", i, rgb[0], rgb[1], rgb[2]);
     int rr = write_sixel_creg(f, i, rgb[0], rgb[1], rgb[2]);
@@ -1233,7 +1350,7 @@ sixel_reblit(sprixel* s){
 
 // write out the sixel header after having quantized the palette.
 static inline int
-sixel_blit_inner(qstate* qs, sixeltable* stab, const blitterargs* bargs, tament* tam){
+sixel_blit_inner(qstate* qs, sixelmap* smap, const blitterargs* bargs, tament* tam){
   fbuf f;
   if(fbuf_init(&f)){
     return -1;
@@ -1244,7 +1361,7 @@ sixel_blit_inner(qstate* qs, sixeltable* stab, const blitterargs* bargs, tament*
   int outy = qs->leny;
   if(outy % 6){
     outy += 6 - (qs->leny % 6);
-    stab->map->p2 = SIXEL_P2_TRANS;
+    smap->p2 = SIXEL_P2_TRANS;
   }
   int parse_start = write_sixel_header(qs, &f, outy);
   if(parse_start < 0){
@@ -1261,7 +1378,7 @@ sixel_blit_inner(qstate* qs, sixeltable* stab, const blitterargs* bargs, tament*
     fbuf_free(&f);
     return -1;
   }
-  s->smap = stab->map;
+  s->smap = smap;
   return 1;
 }
 
@@ -1269,42 +1386,45 @@ sixel_blit_inner(qstate* qs, sixeltable* stab, const blitterargs* bargs, tament*
 // nearest multiple of six greater than or equal to |leny|.
 int sixel_blit(ncplane* n, int linesize, const void* data, int leny, int lenx,
                const blitterargs* bargs){
-  sixeltable stable = {
-    .map = sixelmap_create(leny - bargs->begy),
-  };
-  if(stable.map == NULL){
+  if(bargs->u.pixel.colorregs >= TRANS_PALETTE_ENTRY){
+    logerror("palette too large %d", bargs->u.pixel.colorregs);
+    return -1;
+  }
+  sixelmap* smap = sixelmap_create(leny - bargs->begy);
+  if(smap == NULL){
     return -1;
   }
   assert(n->tam);
-  qstate qs;
-  if(alloc_qstate(bargs->u.pixel.colorregs, &qs)){
+  qstate* qs;
+  if((qs = alloc_qstate(bargs->u.pixel.colorregs)) == NULL){
     logerror("couldn't allocate qstate");
-    sixelmap_free(stable.map);
+    sixelmap_free(smap);
     return -1;
   }
-  qs.bargs = bargs;
-  qs.data = data;
-  qs.linesize = linesize;
-  qs.stab = &stable;
-  qs.leny = leny;
-  qs.lenx = lenx;
-  if(extract_color_table(&qs)){
+  qs->bargs = bargs;
+  qs->data = data;
+  qs->linesize = linesize;
+  qs->smap = smap;
+  qs->leny = leny;
+  qs->lenx = lenx;
+  sixel_engine* sengine = ncplane_pile(n) ? ncplane_notcurses(n)->tcache.sixelengine : NULL;
+  if(extract_color_table(sengine, qs)){
     free(bargs->u.pixel.spx->needs_refresh);
     bargs->u.pixel.spx->needs_refresh = NULL;
-    sixelmap_free(stable.map);
-    free_qstate(&qs);
+    sixelmap_free(smap);
+    free_qstate(qs);
     return -1;
   }
   // takes ownership of sixelmap on success
-  int r = sixel_blit_inner(&qs, &stable, bargs, n->tam);
-  free_qstate(&qs);
+  int r = sixel_blit_inner(qs, smap, bargs, n->tam);
+  free_qstate(qs);
   if(r < 0){
-    sixelmap_free(stable.map);
+    sixelmap_free(smap);
     // FIXME free refresh table?
   }
   scrub_color_table(bargs->u.pixel.spx);
   // we haven't actually emitted the body of the sixel yet. instead, we'll emit
-  // it at sixel_redraw(), thus avoided a double emission in the case of wipes
+  // it at sixel_redraw(), thus avoiding a double emission in the case of wipes
   // taking place before it's visible.
   bargs->u.pixel.spx->wipes_outstanding = 1;
   return r;
@@ -1393,57 +1513,65 @@ int sixel_draw(const tinfo* ti, const ncpile* p, sprixel* s, fbuf* f,
   return s->glyph.used;
 }
 
-// we keep a few worker threads spun up to assist with quantization.
-typedef struct sixel_engine {
-  // FIXME we'll want maybe one per core in our cpuset?
-  pthread_t tids[3];
-  unsigned workers;
-  unsigned workers_wanted;
-  pthread_mutex_t lock;
-  pthread_cond_t cond;
-  void* chunks; // FIXME
-  bool done;
-} sixel_engine;
-
-// FIXME make this part of the context, sheesh
-static sixel_engine globsengine;
-
 // a quantization worker.
 static void *
 sixel_worker(void* v){
-  sixel_engine *sengine = v;
-  pthread_mutex_lock(&globsengine.lock);
-  if(++sengine->workers < sengine->workers_wanted){
-    pthread_mutex_unlock(&globsengine.lock);
-    // don't bail on a failure here
-    if(pthread_create(&sengine->tids[sengine->workers], NULL, sixel_worker, sengine)){
-      logerror("couldn't spin up sixel worker %u", sengine->workers);
-    }
-  }else{
-    pthread_mutex_unlock(&globsengine.lock);
-  }
+  work_queue* wq = v;
+  sixel_engine *sengine = wq->sengine;
+
+  qstate* qs = NULL;
+  unsigned bufpos = 0; // index into worker queue
   do{
     pthread_mutex_lock(&sengine->lock);
-    while(sengine->chunks == NULL && !sengine->done){
+    while(wq->used == 0 && !sengine->done){
       pthread_cond_wait(&sengine->cond, &sengine->lock);
     }
-    if(sengine->done){
-      pthread_mutex_unlock(&sengine->lock);
-      return NULL;
+    if(!sengine->done){
+      qs = wq->qstates[bufpos];
+    }else{
+      qs = NULL;
     }
-    // FIXME take workchunk
     pthread_mutex_unlock(&sengine->lock);
-    // FIXME handle workchunk
+    if(qs == NULL){
+      break;
+    }
+    bandworker(qs);
+    bool sendsignal = false;
+    pthread_mutex_lock(&sengine->lock);
+    --wq->used;
+    if(--qs->refcount == 0){
+      sendsignal = true;
+    }
+    pthread_mutex_unlock(&sengine->lock);
+    if(sendsignal){
+      pthread_cond_broadcast(&sengine->cond);
+    }
+    if(++bufpos == WORKERDEPTH){
+      bufpos = 0;
+    }
   }while(1);
+  return NULL;
 }
 
 static int
-sixel_init_core(const char* initstr, int fd){
-  globsengine.workers = 0;
-  globsengine.workers_wanted = sizeof(globsengine.tids) / sizeof(*globsengine.tids);
-  // don't fail on an error here
-  if(pthread_create(globsengine.tids, NULL, sixel_worker, &globsengine)){
-    logerror("couldn't spin up sixel workers");
+sixel_init_core(tinfo* ti, const char* initstr, int fd){
+  if((ti->sixelengine = malloc(sizeof(sixel_engine))) == NULL){
+    return -1;
+  }
+  sixel_engine* sengine = ti->sixelengine;
+  pthread_mutex_init(&sengine->lock, NULL);
+  pthread_cond_init(&sengine->cond, NULL);
+  sengine->done = false;
+  const int workers_wanted = sizeof(sengine->tids) / sizeof(*sengine->tids);
+  for(int w = 0 ; w < workers_wanted ; ++w){
+    sengine->queues[w].sengine = sengine;
+    sengine->queues[w].writeto = 0;
+    sengine->queues[w].used = 0;
+    if(pthread_create(&sengine->tids[w], NULL, sixel_worker, &sengine->queues[w])){
+      logerror("couldn't spin up sixel worker %d/%d", w, workers_wanted);
+      // FIXME kill any created workers
+      return -1;
+    }
   }
   return tty_emit(initstr, fd);
 }
@@ -1455,22 +1583,136 @@ sixel_init_core(const char* initstr, int fd){
 // private mode 8452 places the cursor at the end of a sixel when it's
 //  emitted. we don't need this for rendered mode, but we do want it for
 //  direct mode. it causes us no problems, so always set it.
-int sixel_init_forcesdm(int fd){
-  return sixel_init_core("\e[?80l\e[?8452h", fd);
+int sixel_init_forcesdm(tinfo* ti, int fd){
+  return sixel_init_core(ti, "\e[?80l\e[?8452h", fd);
 }
 
-int sixel_init_inverted(int fd){
+int sixel_init_inverted(tinfo* ti, int fd){
   // some terminals, at some versions, invert the sense of DECSDM. for those,
   // we must use 80h rather than the correct 80l. this grows out of a
   // misunderstanding in XTerm through patchlevel 368, which was widely
   // copied into other terminals.
-  return sixel_init_core("\e[?80h\e[?8452h", fd);
+  return sixel_init_core(ti, "\e[?80h\e[?8452h", fd);
 }
 
 // if we aren't sure of the semantics of the terminal we're speaking with,
 // don't touch DECSDM at all. it's almost certainly set up the way we want.
-int sixel_init(int fd){
-  return sixel_init_core("\e[?8452h", fd);
+int sixel_init(tinfo* ti, int fd){
+  return sixel_init_core(ti, "\e[?8452h", fd);
+}
+
+// restore the |yoff|th bit of the sixel at |xoff| for the specified vec
+// FIXME this is a very dopey implementation yuck, use RLE at least
+static int
+restore_vec(sixelband* b, int color, int bit, int xoff, int dimx){
+  if(color >= b->size){
+    logpanic("illegal color %d >= %d", color, b->size);
+    return -1;
+  }
+  char* v = NULL;
+  const char* vec = b->vecs[color]; // might be NULL
+  if(vec == NULL){ // write this sixel, and we're done
+    struct band_extender bes = {
+      .rle = 1,
+      .rep = bit,
+    };
+    if((v = sixelband_extend(v, &bes, dimx, xoff)) == NULL){
+      return -1;
+    }
+  }else{
+    int rle = 0; // the repetition number for this element
+    int x = 0;
+    int voff = 0;
+    if((v = malloc(dimx + 1)) == NULL){
+      return -1;
+    }
+    while(*vec){
+      if(isdigit(*vec)){
+        rle *= 10;
+        rle += (*vec - '0');
+      }else if(*vec == '!'){
+        rle = 0;
+      }else{
+        if(rle == 0){
+          rle = 1;
+        }
+        char rep = *vec;
+//fprintf(stderr, "X/RLE/ENDX: %d %d %d\n", x, rle, endx);
+        if(x + rle <= xoff){ // not wiped material; reproduce as-is
+          write_rle(v, &voff, rle, rep);
+          x += rle;
+        }else if(x > xoff){
+          write_rle(v, &voff, rle, rep);
+          x += rle;
+        }else{
+          if(x < xoff){
+            write_rle(v, &voff, xoff - x, rep);
+            rle -= xoff - x;
+            x = xoff;
+          }
+          write_rle(v, &voff, 1, ((rep - 63) | bit) + 63);
+          --rle;
+          ++x;
+          if(rle){
+            write_rle(v, &voff, rle, rep);
+            x += rle;
+          }
+        }
+        rle = 0;
+      }
+      ++vec;
+      if(x > xoff){
+        strcpy(v + voff, vec); // there is always room
+        break;
+      }
+    }
+  }
+  free(b->vecs[color]);
+  b->vecs[color] = v;
+//fprintf(stderr, "SET NEW VEC (%zu) [%s]\n", strlen(v), v);
+  return 0;
+}
+
+// rebuild the portion of some cell which is within this band, having stored
+// the pixels into the auxvec when the cell was wiped (and updated them if we
+// loaded another frame). we go through the auxvec to the right and down,
+// within the area covered by our band. if the entry is transparent, do
+// nothing. otherwise, it is some color; collect other instances of the color,
+// marking them transparent as we do so, and update that color's band. in
+// the worst case (all pixels different colors), this will be p^2 =\ FIXME.
+//
+// returns the number of source-transparent pixels (i.e. pixels which weren't
+// restored), which will be used to update the TAM state.
+static inline int
+restore_band(sixelmap* smap, int band, int startx, int endx,
+             int starty, int endy, int dimx, int cellpxy, int cellpxx,
+             uint8_t* auxvec){
+  int restored = 0;
+  const int sy = band * 6 < starty ? starty - band * 6 : 0;
+  const int ey = (band + 1) * 6 > endy ? 6 - ((band + 1) * 6 - endy) : 6;
+  const int width = endx - startx;
+  const int height = ey - sy;
+  const int totalpixels = width * height;
+  sixelband* b = &smap->bands[band];
+//fprintf(stderr, "RESTORING band %d (%d->%d (%d->%d), %d->%d) %d pixels\n", band, sy, ey, starty, endy, startx, endx, totalpixels);
+  int yoff = ((band * 6) + sy - starty) % cellpxy; // we start off on this row of the auxvec
+  int xoff = startx % cellpxx;
+  for(int dy = sy ; dy < ey ; ++dy, ++yoff){
+    const int idx = (yoff * cellpxx + xoff) * AUXVECELEMSIZE;
+    const int bit = 1 << dy;
+//fprintf(stderr, " looking at bandline %d (auxvec row %d idx %d, dy %d)\n", dy, yoff, idx, dy);
+    for(int dx = 0 ; startx + dx < endx ; ++dx){
+      uint16_t color;
+      memcpy(&color, &auxvec[idx + dx * AUXVECELEMSIZE], AUXVECELEMSIZE);
+//fprintf(stderr, "  idx %d (dx %d x %d): %hu\n", idx, dx, dx + startx, color);
+      if(color != TRANS_PALETTE_ENTRY){
+        restore_vec(b, color, bit, startx + dx, dimx);
+        ++restored;
+      }
+    }
+  }
+  (void)smap;
+  return totalpixels - restored;
 }
 
 // only called for cells in SPRIXCELL_ANNIHILATED[_TRANS]. just post to
@@ -1478,45 +1720,37 @@ int sixel_init(int fd){
 // just like wiping. this is necessary due to the complex nature of
 // modifying a Sixel -- we want to do them all in one batch.
 int sixel_rebuild(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
-  s->wipes_outstanding = true;
-  sixelmap* smap = s->smap;
-  const int cellpxx = ncplane_pile(s->n)->cellpxx;
+//fprintf(stderr, "REBUILDING %d/%d\n", ycell, xcell);
+  if(auxvec == NULL){
+    return -1;
+  }
   const int cellpxy = ncplane_pile(s->n)->cellpxy;
+  const int cellpxx = ncplane_pile(s->n)->cellpxx;
+  sixelmap* smap = s->smap;
   const int startx = xcell * cellpxx;
   const int starty = ycell * cellpxy;
-  int endx = ((xcell + 1) * cellpxx) - 1;
-  if(endx > s->pixx){
+  int endx = ((xcell + 1) * cellpxx);
+  if(endx >= s->pixx){
     endx = s->pixx;
   }
-  int endy = ((ycell + 1) * cellpxy) - 1;
-  if(endy > s->pixy){
+  int endy = ((ycell + 1) * cellpxy);
+  if(endy >= s->pixy){
     endy = s->pixy;
   }
-  int transparent = 0;
+  const int startband = starty / 6;
+  const int endband = (endy - 1) / 6;
 //fprintf(stderr, "%d/%d start: %d/%d end: %d/%d bands: %d-%d\n", ycell, xcell, starty, startx, endy, endx, starty / 6, endy / 6);
-  /* FIXME
-  for(int x = startx ; x <= endx ; ++x){
-    for(int y = starty ; y <= endy ; ++y){
-      int auxvecidx = (y - starty) * cellpxx + (x - startx);
-      int trans = auxvec[cellpxx * cellpxy + auxvecidx];
-      if(!trans){
-        int color = auxvec[auxvecidx];
-        int coff = smap->sixelcount * color;
-        int band = y / 6;
-        int boff = coff + band * s->pixx;
-        int xoff = boff + x;
-//fprintf(stderr, "%d/%d band: %d coff: %d boff: %d rebuild %d/%d with color %d from %d %p xoff: %d\n", ycell, xcell, band, coff, boff, y, x, color, auxvecidx, auxvec, xoff);
-        s->smap->data[xoff] |= (1u << (y % 6));
-      }else{
-        ++transparent;
-      }
-    }
+  // walk through each color, and wipe the necessary sixels from each band
+  int w = 0;
+  for(int b = startband ; b <= endband ; ++b){
+    w += restore_band(smap, b, startx, endx, starty, endy, s->pixx,
+                      cellpxy, cellpxx, auxvec);
   }
-  */
+  s->wipes_outstanding = true;
   sprixcell_e newstate;
-  if(transparent == cellpxx * cellpxy){
+  if(w == cellpxx * cellpxy){
     newstate = SPRIXCELL_TRANSPARENT;
-  }else if(transparent){
+  }else if(w){
     newstate = SPRIXCELL_MIXED_SIXEL;
   }else{
     newstate = SPRIXCELL_OPAQUE_SIXEL;
@@ -1526,27 +1760,32 @@ int sixel_rebuild(sprixel* s, int ycell, int xcell, uint8_t* auxvec){
 }
 
 void sixel_cleanup(tinfo* ti){
-  (void)ti; // FIXME pick up globsengine from ti!
-  unsigned tids = 0;
-  pthread_mutex_lock(&globsengine.lock);
-  globsengine.done = 1;
-  tids = globsengine.workers;
-  pthread_mutex_unlock(&globsengine.lock);
-  pthread_cond_broadcast(&globsengine.cond);
-  // FIXME what if we spawned another worker since taking zee lock?
+  sixel_engine* sengine = ti->sixelengine;
+  const unsigned tids = POPULATION;
+  pthread_mutex_lock(&sengine->lock);
+  sengine->done = 1;
+  pthread_mutex_unlock(&sengine->lock);
+  pthread_cond_broadcast(&sengine->cond);
   loginfo("joining %u sixel thread%s", tids, tids == 1 ? "" : "s");
   for(unsigned t = 0 ; t < tids ; ++t){
-    pthread_join(globsengine.tids[t], NULL);
+    pthread_join(sengine->tids[t], NULL);
   }
+  pthread_mutex_destroy(&sengine->lock);
+  pthread_cond_destroy(&sengine->cond);
+  free(sengine);
   loginfo("reaped sixel engine");
+  ti->sixelengine = NULL;
   // no way to know what the state was before; we ought use XTSAVE/XTRESTORE
 }
 
+// create an auxiliary vector suitable for a Sixel sprixcell, and zero it out.
+// there are two bytes per pixel in the cell: a palette index of up to 65534,
+// or 65535 to indicate transparency.
 uint8_t* sixel_trans_auxvec(const ncpile* p){
-  const size_t slen = 3 * p->cellpxy * p->cellpxx;
+  const size_t slen = AUXVECELEMSIZE * p->cellpxy * p->cellpxx;
   uint8_t* a = malloc(slen);
   if(a){
-    memset(a, 0, slen);
+    memset(a, 0xff, slen);
   }
   return a;
 }

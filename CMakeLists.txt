@@ -1,6 +1,6 @@
 # 3.14.0 introduced NAME_WLE
 cmake_minimum_required(VERSION 3.14.0)
-project(notcurses VERSION 3.0.5
+project(notcurses VERSION 3.0.8
   DESCRIPTION "Blingful UI for modern terminal emulators"
   HOMEPAGE_URL "https://nick-black.com/dankwiki/index.php/notcurses"
   LANGUAGES C)
@@ -128,7 +128,7 @@ endif()
 if(MSVC)
 add_compile_options(/W4)
 else()
-add_compile_options(-Wall -Wextra -W -Wshadow -Wvla)
+add_compile_options(-Wall -Wextra -W -Wshadow -Wvla -Wstrict-aliasing=2)
 # -ffast-math dies on NaNs we draw from libav (by -ffinite-math-only)
 add_compile_options(-fno-signed-zeros -fno-trapping-math -fassociative-math)
 add_compile_options(-fno-math-errno -freciprocal-math -funsafe-math-optimizations)

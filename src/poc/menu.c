@@ -30,14 +30,20 @@ run_menu(struct notcurses* nc, struct ncmenu* ncm){
   notcurses_render(nc);
   while((keypress = notcurses_get_blocking(nc, &ni)) != (uint32_t)-1){
     if(!ncmenu_offer_input(ncm, &ni)){
-      if(ni.evtype == NCTYPE_RELEASE){
+      const char* sel;
+      if( (sel = ncmenu_mouse_selected(ncm, &ni, NULL)) ){
+        if(sel && !strcmp(sel, "Quit")){
+          ncmenu_destroy(ncm);
+          ncplane_destroy(selplane);
+          return 0;
+        }
+      }else if(ni.evtype == NCTYPE_RELEASE){
         continue;
       }else if(keypress == 'q'){
         ncmenu_destroy(ncm);
         ncplane_destroy(selplane);
         return 0;
       }else if(keypress == NCKEY_ENTER){ // selected a menu item
-        const char* sel;
         if( (sel = ncmenu_selected(ncm, &ni)) ){
           if(strcmp(sel, "Quit") == 0){
             ncmenu_destroy(ncm);
@@ -70,7 +76,7 @@ int main(void){
   notcurses_mice_enable(nc, NCMICE_BUTTON_EVENT);
   struct ncmenu_item demo_items[] = {
     { .desc = "Restart", .shortcut = { .id = 'r', .modifiers = NCKEY_MOD_CTRL, }, },
-    { .desc = "Disabled", .shortcut = { .id = 'd', }, },
+    { .desc = "Derp", .shortcut = { .id = 'd', }, },
   };
   struct ncmenu_item file_items[] = {
     { .desc = "New", .shortcut = { .id = 'n', .modifiers = NCKEY_MOD_CTRL, }, },
@@ -108,10 +114,10 @@ int main(void){
   if(top == NULL){
     goto err;
   }
-  if(ncmenu_item_set_status(top, "Schwarzgerät", "Disabled", false)){
+  if(ncmenu_item_set_status(top, "Schwarzgerät", "Restart", false)){
     goto err;
   }
-  if(ncmenu_item_set_status(top, "Schwarzgerät", "Restart", false)){
+  if(ncmenu_item_set_status(top, "File", "Open", false)){
     goto err;
   }
   uint64_t channels = 0;
@@ -133,6 +139,12 @@ int main(void){
   mopts.flags |= NCMENU_OPTION_BOTTOM;
   struct ncmenu* bottom = ncmenu_create(n, &mopts);
   if(bottom == NULL){
+    goto err;
+  }
+  if(ncmenu_item_set_status(bottom, "Schwarzgerät", "Restart", false)){
+    goto err;
+  }
+  if(ncmenu_item_set_status(bottom, "Schwarzgerät", "Derp", false)){
     goto err;
   }
   if(ncplane_putstr_aligned(n, 0, NCALIGN_RIGHT, " -=+ menu poc. press q to exit +=- ") < 0){

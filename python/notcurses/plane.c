@@ -1650,6 +1650,15 @@ NcPlane_pile_render_to_file(NcPlaneObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+static PyObject *
+NcPlane_scrollup(NcPlaneObject *self, PyObject *args)
+{
+    int r;
+    GNU_PY_CHECK_BOOL(PyArg_ParseTuple(args, "i", &r));
+    CHECK_NOTCURSES(ncplane_scrollup(self->ncplane_ptr, r));
+    Py_RETURN_NONE;
+}
+
 /*
 static PyObject *
 NcPlane_(NcPlaneObject *self, PyObject *args)
@@ -1675,7 +1684,7 @@ static PyMethodDef NcPlane_methods[] = {
 
     {"translate", (void *)NcPlane_translate, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("provided a coordinate relative to the origin of 'src', map it to the same absolute coordinate relative to the origin of 'dst'.")},
     {"translate_abs", (PyCFunction)NcPlane_translate_abs, METH_VARARGS, PyDoc_STR("Fed absolute 'y'/'x' coordinates, determine whether that coordinate is within the ncplane.")},
-    {"set_scrolling", (PyCFunction)NcPlane_set_scrolling, METH_NOARGS, PyDoc_STR("All planes are created with scrolling disabled. Returns true if scrolling was previously enabled, or false if it was disabled.")},
+    {"set_scrolling", (PyCFunction)NcPlane_set_scrolling, METH_VARARGS, PyDoc_STR("All planes are created with scrolling disabled. Returns true if scrolling was previously enabled, or false if it was disabled.")},
 
     {"resize", (void *)NcPlane_resize, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("Resize the specified ncplane.")},
     {"resize_simple", (PyCFunction)NcPlane_resize_simple, METH_VARARGS, PyDoc_STR("Resize the plane, retaining what data we can (everything, unless we're shrinking in some dimension). Keep the origin where it is.")},
@@ -1802,7 +1811,7 @@ static PyMethodDef NcPlane_methods[] = {
 
     {"cells_load_box", (void *)NcPlane_cells_load_box, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("Load up six cells with the EGCs necessary to draw a box.")},
     {"cells_rounded_box", (void *)NcPlane_cells_rounded_box, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("Load up six cells with the EGCs necessary to draw a round box.")},
-    {"perimeter_rounded", (void *)NcPlane_perimeter_rounded, METH_VARARGS, PyDoc_STR("Draw a perimeter around plane.")},
+    {"perimeter_rounded", (void *)NcPlane_perimeter_rounded, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("Draw a perimeter around plane.")},
 
     {"rounded_box_sized", (void *)NcPlane_rounded_box_sized, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("Draw a round box around plane.")},
     {"cells_double_box", (void *)NcPlane_cells_double_box, METH_VARARGS | METH_KEYWORDS, PyDoc_STR("Draw a double box with cells.")},
@@ -1839,6 +1848,8 @@ static PyMethodDef NcPlane_methods[] = {
 
     {"pile_render_to_buffer", (PyCFunction)NcPlane_pile_render_to_buffer, METH_NOARGS, "Perform the rendering and rasterization portion of notcurses_render() and write it to bytes object instead of terminal."},
     {"render_to_file", (PyCFunction)NcPlane_pile_render_to_file, METH_VARARGS, "Write the last rendered frame, in its entirety, to file descriptor. If render() has not yet been called, nothing will be written."},
+
+    {"scrollup", (PyCFunction)NcPlane_scrollup, METH_VARARGS, "Effect scroll events on the plane."},
 
     //  {"", (PyCFunction) NULL, METH_VARARGS, PyDoc_STR("")},
     {NULL, NULL, 0, NULL},

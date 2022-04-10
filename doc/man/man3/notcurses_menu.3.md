@@ -1,6 +1,6 @@
 % notcurses_menu(3)
 % nick black <nickblack@linux.com>
-% v3.0.5
+% v3.0.8
 
 # NAME
 
@@ -86,6 +86,11 @@ call into the application. **ncmenu_offer_input** will handle clicks to unroll
 menu sections, clicks to dismiss the menu, Escape to dismiss the menu, left
 and right to change menu sections, and up and down to change menu items (these
 latter are only consumed if there is an actively unrolled section).
+
+Items can be disabled with **ncmenu_item_set_status**. Pass **false** to
+disable the item, or **true** to enable it. All items are enabled by
+default. A disabled item will not be returned with **ncmenu_mouse_selected**,
+nor reached with **ncmenu_nextsection** nor **ncmenu_prevsection**.
 
 # RETURN VALUES
 

@@ -19,6 +19,7 @@
 #include "banner.h"
 
 #define ESC "\x1b"
+#define TABSTOP 8
 
 void notcurses_version_components(int* major, int* minor, int* patch, int* tweak){
   *major = NOTCURSES_VERNUM_MAJOR;
@@ -1727,11 +1728,15 @@ void scroll_down(ncplane* n){
 //fprintf(stderr, "pre-scroll: %d/%d %d/%d log: %d scrolling: %u\n", n->y, n->x, n->leny, n->lenx, n->logrow, n->scrolling);
   n->x = 0;
   if(n->y == n->leny - 1){
+    // we're on the last line of the plane
     if(n->autogrow){
       ncplane_resize_simple(n, n->leny + 1, n->lenx);
       ncplane_cursor_move_yx(n, n->leny - 1, 0);
       return;
     }
+    // we'll actually be scrolling material up and out, and making a new line.
+    // if this is the standard plane, that means a "physical" scroll event is
+    // called for.
     if(n == notcurses_stdplane(ncplane_notcurses(n))){
       ncplane_pile(n)->scrolls++;
     }
@@ -1764,6 +1769,9 @@ int ncplane_scrollup(ncplane* n, int r){
   }
   while(r-- > 0){
     scroll_down(n);
+  }
+  if(n == notcurses_stdplane(ncplane_notcurses(n))){
+    notcurses_render(ncplane_notcurses(n));
   }
   return 0;
 }
@@ -1810,17 +1818,19 @@ ncplane_put(ncplane* n, int y, int x, const char* egc, int cols,
     return -1;
   }
   // reject any control character for output other than newline (and then only
-  // on a scrolling plane).
-  if(*egc == '\n'){
-    // if we're not scrolling, autogrow would be to the right (as opposed to
-    // down), and thus it still wouldn't apply to the case of a newline.
-    if(!n->scrolling){
-      logerror("rejecting newline on non-scrolling plane");
+  // on a scrolling plane) and tab.
+  if(is_control_egc((const unsigned char*)egc, bytes)){
+    if(*egc == '\n'){
+      // if we're not scrolling, autogrow would be to the right (as opposed to
+      // down), and thus it still wouldn't apply to the case of a newline.
+      if(!n->scrolling){
+        logerror("rejecting newline on non-scrolling plane");
+        return -1;
+      }
+    }else if(*egc != '\t'){
+      logerror("rejecting %dB control character", bytes);
       return -1;
     }
-  }else if(is_control_egc((const unsigned char*)egc, bytes)){
-    logerror("rejecting %dB control character", bytes);
-    return -1;
   }
   // check *before ncplane_cursor_move_yx()* whether we're past the end of the
   // line. if scrolling is enabled, move to the next line if so. if x or y are
@@ -1840,9 +1850,11 @@ ncplane_put(ncplane* n, int y, int x, const char* egc, int cols,
       linesend = true;
     }
   }
+  bool scrolled = false;
   if(linesend){
     if(n->scrolling){
       scroll_down(n);
+      scrolled = true;
     }else if(n->autogrow){
       ncplane_resize_simple(n, n->leny, n->lenx + cols);
     }else{
@@ -1856,6 +1868,7 @@ ncplane_put(ncplane* n, int y, int x, const char* egc, int cols,
   }
   if(*egc == '\n'){
     scroll_down(n);
+    scrolled = true;
   }
   // A wide character obliterates anything to its immediate right (and marks
   // that cell as wide). Any character placed atop one cell of a wide character
@@ -1880,13 +1893,32 @@ ncplane_put(ncplane* n, int y, int x, const char* egc, int cols,
   }
   targ->stylemask = stylemask;
   targ->channels = channels;
-  if(cell_load_direct(n, targ, egc, bytes, cols) < 0){
-    return -1;
+  // tabs get replaced with spaces, up to the next tab stop. we always try to
+  // write at least one. if there are no more tabstops on the current line, if
+  // autogrowing to the right, extend as necessary. otherwise, if scrolling,
+  // move to the next line. otherwise, simply fill any spaces we can. this has
+  // already taken place by the time we get here, if it ought have happened.
+  if(*egc == '\t'){
+    cols = TABSTOP - (n->x % TABSTOP);
+    if(n->x + 1 >= n->lenx){
+      if(!n->scrolling && n->autogrow){
+        ncplane_resize_simple(n, n->leny, n->lenx + (cols ? cols - 1 : TABSTOP - 1));
+        // must refresh targ; resize invalidated it
+        targ = ncplane_cell_ref_yx(n, n->y, n->x);
+      }
+    }
+    if(cell_load_direct(n, targ, " ", bytes, 1) < 0){
+      return -1;
+    }
+  }else{
+    if(cell_load_direct(n, targ, egc, bytes, cols) < 0){
+      return -1;
+    }
   }
 //fprintf(stderr, "%08x %016lx %c %d %d\n", targ->gcluster, targ->channels, nccell_double_wide_p(targ) ? 'D' : 'd', bytes, cols);
-  // must set our right hand sides wide, and check for further damage
   if(*egc != '\n'){
     ++n->x;
+    // if wide, set our right hand columns wide, and check for further damage
     for(int i = 1 ; i < cols ; ++i){
       nccell* candidate = &n->fb[nfbcellidx(n, n->y, n->x)];
       int off = nccell_cols(candidate);
@@ -1894,10 +1926,21 @@ ncplane_put(ncplane* n, int y, int x, const char* egc, int cols,
       while(--off > 0){
         nccell_obliterate(n, &n->fb[nfbcellidx(n, n->y, n->x + off)]);
       }
-      candidate->channels = targ->channels;
-      candidate->stylemask = targ->stylemask;
-      candidate->width = targ->width;
+      if(*egc != '\t'){
+        candidate->channels = targ->channels;
+        candidate->stylemask = targ->stylemask;
+        candidate->width = targ->width;
+      }else{
+        if(cell_load_direct(n, candidate, " ", bytes, 1) < 0){
+          return -1;
+        }
+      }
       ++n->x;
+    }
+  }
+  if(scrolled){
+    if(n == notcurses_stdplane(ncplane_notcurses(n))){
+      notcurses_render(ncplane_notcurses(n));
     }
   }
   return cols;

@@ -136,7 +136,7 @@ dup_menu_section(ncmenu_int_section* dst, const struct ncmenu_section* src){
     return -1;
   }
   dst->bodycols = 0;
-  dst->itemselected = 0;
+  dst->itemselected = -1;
   dst->items = NULL;
   // we must reject any section which is entirely separators
   bool gotitem = false;
@@ -480,13 +480,16 @@ int ncmenu_unroll(ncmenu* n, int sectionidx){
   if(ncplane_rounded_box_sized(n->ncp, 0, n->headerchannels, height, width, 0)){
     return -1;
   }
-  const ncmenu_int_section* sec = &n->sections[sectionidx];
+  ncmenu_int_section* sec = &n->sections[sectionidx];
   for(unsigned i = 0 ; i < sec->itemcount ; ++i){
     ++ypos;
     if(sec->items[i].desc){
       // FIXME the user ought be able to configure the disabled channel
       if(!sec->items[i].disabled){
         ncplane_set_channels(n->ncp, n->sectionchannels);
+        if(sec->itemselected < 0){
+          sec->itemselected = i;
+        }
       }else{
         ncplane_set_channels(n->ncp, n->disablechannels);
       }
@@ -559,10 +562,13 @@ int ncmenu_rollup(ncmenu* n){
 
 int ncmenu_nextsection(ncmenu* n){
   int nextsection = n->unrolledsection;
-  // FIXME probably best to detect cycles
+  int origselected = n->unrolledsection;
   do{
     if(++nextsection == n->sectioncount){
       nextsection = 0;
+    }
+    if(nextsection == origselected){
+      break;
     }
   }while(n->sections[nextsection].name == NULL ||
          n->sections[nextsection].enabled_item_count == 0);
@@ -571,10 +577,13 @@ int ncmenu_nextsection(ncmenu* n){
 
 int ncmenu_prevsection(ncmenu* n){
   int prevsection = n->unrolledsection;
-  // FIXME probably best to detect cycles
+  int origselected = n->unrolledsection;
   do{
     if(--prevsection < 0){
       prevsection = n->sectioncount - 1;
+    }
+    if(prevsection == origselected){
+      break;
     }
   }while(n->sections[prevsection].name == NULL ||
          n->sections[prevsection].enabled_item_count == 0);
@@ -588,12 +597,17 @@ int ncmenu_nextitem(ncmenu* n){
     }
   }
   ncmenu_int_section* sec = &n->sections[n->unrolledsection];
-  // FIXME probably best to detect cycles
-  do{
-    if((unsigned)++sec->itemselected == sec->itemcount){
-      sec->itemselected = 0;
-    }
-  }while(!sec->items[sec->itemselected].desc || sec->items[sec->itemselected].disabled);
+  int origselected = sec->itemselected;
+  if(origselected >= 0){
+    do{
+      if((unsigned)++sec->itemselected == sec->itemcount){
+        sec->itemselected = 0;
+      }
+      if(sec->itemselected == origselected){
+        break;
+      }
+    }while(!sec->items[sec->itemselected].desc || sec->items[sec->itemselected].disabled);
+  }
   return ncmenu_unroll(n, n->unrolledsection);
 }
 
@@ -604,12 +618,17 @@ int ncmenu_previtem(ncmenu* n){
     }
   }
   ncmenu_int_section* sec = &n->sections[n->unrolledsection];
-  // FIXME probably best to detect cycles
-  do{
-    if(sec->itemselected-- == 0){
-      sec->itemselected = sec->itemcount - 1;
-    }
-  }while(!sec->items[sec->itemselected].desc || sec->items[sec->itemselected].disabled);
+  int origselected = sec->itemselected;
+  if(origselected >= 0){
+    do{
+      if(sec->itemselected-- == 0){
+        sec->itemselected = sec->itemcount - 1;
+      }
+      if(sec->itemselected == origselected){
+        break;
+      }
+    }while(!sec->items[sec->itemselected].desc || sec->items[sec->itemselected].disabled);
+  }
   return ncmenu_unroll(n, n->unrolledsection);
 }
 
@@ -619,10 +638,36 @@ const char* ncmenu_selected(const ncmenu* n, ncinput* ni){
   }
   const struct ncmenu_int_section* sec = &n->sections[n->unrolledsection];
   const int itemidx = sec->itemselected;
+  if(itemidx < 0){
+    return NULL;
+  }
   if(ni){
     memcpy(ni, &sec->items[itemidx].shortcut, sizeof(*ni));
   }
   return sec->items[itemidx].desc;
+}
+
+// given the active section, return the line on which we clicked, or -1 if the
+// click was not within said section. |y| and |x| ought be translated for the
+// menu plane |n|->ncp.
+static int
+ncsection_click_index(const ncmenu* n, const ncmenu_int_section* sec,
+                      unsigned dimy, unsigned dimx, int y, int x){
+  // don't allow a click on the side boundaries
+  if(sec->xoff < 0){
+    if(x > (int)dimx - 4 || x <= (int)dimx - 4 - sec->bodycols){
+      return -1;
+    }
+  }else{
+    if(x <= sec->xoff || x > sec->xoff + sec->bodycols){
+      return -1;
+    }
+  }
+  const int itemidx = n->bottom ? y - ((int)dimy - (int)sec->itemcount) + 2 : y - 2;
+  if(itemidx < 0 || itemidx >= (int)sec->itemcount){
+    return -1;
+  }
+  return itemidx;
 }
 
 const char* ncmenu_mouse_selected(const ncmenu* n, const ncinput* click,
@@ -641,19 +686,18 @@ const char* ncmenu_mouse_selected(const ncmenu* n, const ncinput* click,
   if(!ncplane_translate_abs(nc, &y, &x)){
     return NULL;
   }
-  // FIXME section_x() works only off the section header lengths, meaning that
-  // if we click an item outside of those columns covered by the header, it will
-  // read as a -1 from section_x(). we want to instead get the unrolled section,
-  // find its boundaries, and verify that we are within them.
-  int i = section_x(n, x);
-  if(i < 0 || i != n->unrolledsection){
+  if(n->unrolledsection < 0){
     return NULL;
   }
   const struct ncmenu_int_section* sec = &n->sections[n->unrolledsection];
-  if(y < 2 || (unsigned)y - 2 >= sec->itemcount){
+  int itemidx = ncsection_click_index(n, sec, dimy, dimx, y, x);
+  if(itemidx < 0){
     return NULL;
   }
-  const int itemidx = y - 2;
+  // don't allow a disabled item to be selected
+  if(sec->items[itemidx].disabled){
+    return NULL;
+  }
   if(ni){
     memcpy(ni, &sec->items[itemidx].shortcut, sizeof(*ni));
   }
@@ -670,6 +714,17 @@ bool ncmenu_offer_input(ncmenu* n, const ncinput* nc){
     ncplane_dim_yx(n->ncp, &dimy, &dimx);
     if(!ncplane_translate_abs(n->ncp, &y, &x)){
       return false;
+    }
+    if(n->unrolledsection >= 0){
+      struct ncmenu_int_section* sec = &n->sections[n->unrolledsection];
+      int itemidx = ncsection_click_index(n, sec, dimy, dimx, y, x);
+      if(itemidx >= 0){
+        if(!sec->items[itemidx].disabled){
+          sec->itemselected = itemidx;
+          ncmenu_unroll(n, n->unrolledsection);
+          return false;
+        }
+      }
     }
     if(y != (n->bottom ? (int)dimy - 1 : 0)){
       return false;
@@ -734,7 +789,7 @@ int ncmenu_item_set_status(ncmenu* n, const char* section, const char* item,
       for(unsigned ii = 0 ; ii < sec->itemcount ; ++ii){
         struct ncmenu_int_item* i = &sec->items[ii];
         if(strcmp(i->desc, item) == 0){
-          const bool changed = i->disabled == enabled;
+          const bool changed = (i->disabled != enabled);
           i->disabled = !enabled;
           if(changed){
             if(i->disabled){

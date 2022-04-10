@@ -834,7 +834,11 @@ apply_msterminal_heuristics(tinfo* ti){
 }
 
 static const char*
-apply_contour_heuristics(tinfo* ti, bool* forcesdm, bool* invertsixel){
+apply_contour_heuristics(tinfo* ti, size_t* tablelen, size_t* tableused,
+                         bool* forcesdm, bool* invertsixel){
+  if(add_smulx_escapes(ti, tablelen, tableused)){
+    return NULL;
+  }
   ti->caps.quadrants = true;
   ti->caps.sextants = true;
   ti->caps.rgb = true;
@@ -967,7 +971,8 @@ apply_term_heuristics(tinfo* ti, const char* tname, queried_terminals_e qterm,
       newname = apply_msterminal_heuristics(ti);
       break;
     case TERMINAL_CONTOUR:
-      newname = apply_contour_heuristics(ti, forcesdm, invertsixel);
+      newname = apply_contour_heuristics(ti, tablelen, tableused,
+                                         forcesdm, invertsixel);
       break;
     case TERMINAL_ITERM:
       newname = apply_iterm_heuristics(ti, tablelen, tableused);
@@ -1215,7 +1220,9 @@ handle_responses(tinfo* ti, size_t* tablelen, size_t* tableused,
   }
   // kitty trumps sixel, when both are available
   if((*kitty_graphics = iresp->kitty_graphics) == 0){
-    ti->color_registers = iresp->color_registers;
+    if((ti->color_registers = iresp->color_registers) > SIXEL_MAX_REGISTERS){
+      ti->color_registers = SIXEL_MAX_REGISTERS;
+    }
     ti->sixel_maxy_pristine = iresp->sixely;
     ti->sixel_maxy = iresp->sixely;
     ti->sixel_maxx = iresp->sixelx;
@@ -1259,6 +1266,7 @@ int interrogate_terminfo(tinfo* ti, FILE* out, unsigned utf8,
     cursor_y = &foolcursor_y;
   }
   *cursor_x = *cursor_y = -1;
+  ti->sixelengine = NULL;
   ti->bg_collides_default = 0xfe000000;
   ti->fg_default = 0xff000000;
   ti->kbdlevel = UINT_MAX; // see comment in tinfo definition
